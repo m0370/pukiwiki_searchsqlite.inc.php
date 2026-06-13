@@ -1,0 +1,165 @@
+## SQLiteキャッシュ全文検索プラグイン searchsqlite.inc.php
+
+PukiWiki標準のサイト内検索 `search` を、SQLiteによる検索用キャッシュで高速化するプラグインです。
+
+## 概要
+
+PukiWiki標準のサイト内検索（`do_search`）は、検索のたびに全ページの `wiki/*.txt` を個別に開いて正規表現照合します。ページ数が数千規模になると、共有サーバーやI/O性能の低い環境で「大量の小ファイルを開く」コストがボトルネックとなり、検索が著しく遅くなります。
+
+本プラグインは、ページ本文を `cache/search.sqlite` に集約した検索用キャッシュを用い、検索時のファイルオープン回数を大幅に削減して高速化します。検索語の正規化・正規表現照合は標準検索の処理（`get_search_words()`）をそのまま流用しているため、**検索結果は標準検索と一致します**。
+
+正本データは従来どおり `wiki/*.txt` と `attach/` のままで、SQLiteは削除・再生成が可能な派生キャッシュにすぎません。SQLiteが使えない・壊れた・失敗した場合は、すべて標準の `do_search()` にフォールバックするため、検索機能が停止することはありません。
+
+PukiWikiの「ファイルベース」「設置容易」「壊れても戻せる」という性質を維持したまま、現実的に検索を高速化することを目的としています。
+
+### 実測（677ページ・UTF-8環境）
+
+- 温暖時の検索: 標準 253ms → SQLite 27ms（**約9.3倍高速**、7語あたり）
+- 初回キャッシュ構築: 約156ms
+- `search.sqlite` サイズ: 約3.7MB
+
+共有サーバーの遅い小ファイルI/O環境では、差はさらに大きくなる見込みです。
+
+## ダウンロード
+
+ダウンロードして保存し、plugin ディレクトリに置いてください。常に開発版です。
+
+PukiWiki EUC-JP 版をお使いの方はファイル内文字コードを UTF-8 から EUC-JP に変更して保存してください。本文照合はバイト単位（`/S`、`/u`なし）で行うため、UTF-8版・EUC-JP版のどちらでも動作します。
+
+### 動作要件
+
+- PHP の SQLite3 拡張（`class_exists('SQLite3')`）。無い場合は自動的に標準検索へフォールバックします。
+- `cache/` ディレクトリへの書き込み権限。書き込めない場合も標準検索へフォールバックします。
+
+## インストール
+
+ユーザーが設置・変更するファイルは2つだけです。`lib/` ディレクトリは一切変更しません。
+
+```text
+plugin/search.inc.php       … 標準検索プラグイン（最小改変）
+plugin/searchsqlite.inc.php … SQLite検索本体
+```
+
+### 1. searchsqlite.inc.php を設置
+
+`plugin/searchsqlite.inc.php` を plugin ディレクトリに置きます。
+
+### 2. search.inc.php を最小改変
+
+標準 `plugin/search.inc.php` の検索実行部にある以下の行を、
+
+```php
+$body = do_search($vars['word'], $type, FALSE, $base);
+```
+
+次のように置き換えます。
+
+```php
+// --- searchsqlite: SQLiteキャッシュ版があれば使い、無ければ標準検索へ ---
+if (file_exists(PLUGIN_DIR . 'searchsqlite.inc.php')) {
+    require_once(PLUGIN_DIR . 'searchsqlite.inc.php');
+}
+$body = function_exists('plugin_searchsqlite_do_search')
+    ? plugin_searchsqlite_do_search($vars['word'], $type, FALSE, $base)
+    : do_search($vars['word'], $type, FALSE, $base);
+// --- searchsqlite ここまで ---
+```
+
+本リポジトリには、この改変を適用済みの `search.inc.php`（PukiWiki標準版ベース）を同梱しています。標準の `search.inc.php` をそのまま使っている場合は、こちらで置き換えても構いません。独自に改変している場合は、上記の差分のみを手で当ててください。
+
+この設計により、`searchsqlite.inc.php` が未設置・破損、あるいは `plugin_searchsqlite_do_search()` が未定義の場合でも、自動的に標準検索へフォールバックします。
+
+### 3. 初回検索
+
+初回検索時に `cache/search.sqlite` が自動生成されます。以後、ページの追加・更新・削除は鮮度検査により自動で反映されます。
+
+## キャッシュの仕組み
+
+### 自動生成されるファイル
+
+```text
+cache/search.sqlite   … 検索用キャッシュDB（削除可。次回検索時に再生成）
+cache/search.lock     … 再構築時の多重実行を防ぐロックファイル
+```
+
+`cache/search.sqlite` は削除しても問題ありません。次回検索時に `wiki/*.txt` と `attach/` から再構築されます。
+
+### 鮮度検査と再構築（案A: 全再構築方式）
+
+- `cache/search.sqlite` が無い、またはスキーマ版が違う場合は全再構築します。
+- 直近の検査から `$searchsqlite_check_interval` 秒（既定300秒）以内は、鮮度検査自体を省略します（低速ファイルシステムでの負担軽減）。
+- 検査時はページ数の変化と、ファイルの更新時刻（`filemtime`）が前回再構築より新しいかどうかを確認し、変化があれば全再構築します。
+- 再構築は `cache/search.lock` の排他ロックで多重実行を防ぎます。別プロセスが再構築中の場合は既存DBで検索します。
+- 再構築中にエラーが起きた場合は `ROLLBACK` し、標準検索へフォールバックします。
+
+## 設定項目
+
+`pukiwiki.ini.php` 等でグローバル変数として上書きできます（既定値で動作します）。
+
+```php
+// SQLite検索を有効化するか（0 で常に標準検索へフォールバック）
+$searchsqlite_enable = 1;
+
+// 添付ファイル名検索を有効化するか
+$searchsqlite_search_attachments = 1;
+
+// キャッシュ鮮度検査の最小間隔（秒）
+$searchsqlite_check_interval = 300;
+
+// 添付ファイル名ヒットの初期表示上限件数（超過分は「他N件」と表示）
+$searchsqlite_attach_show_max = 3;
+
+// デバッグ表示（1 で検索結果末尾に診断コメントを出す）
+$searchsqlite_debug = 0;
+```
+
+## 添付ファイル名検索
+
+標準検索にはない追加機能として、添付ファイル名を検索対象に含められます（`$searchsqlite_search_attachments = 1`）。
+
+添付ファイル名にヒットした場合は、検索結果のページ名の下に `small` クラスで補助表示します。
+
+```html
+<li><a href="...">ASCO2026</a>
+  <div class="small">添付ファイル: ASCO2026_slidedeck.pdf, ASCO2026_program.xlsx</div>
+</li>
+```
+
+添付ファイル名の照合は、ページ名・本文のどちらにもヒットしなかったページに対してのみ行います。表示は既定で最大3件までとし、超過分は「他N件」と表示します。
+
+添付ファイル名は `attach/` 内の `HEXページ名_HEXファイル名` 形式から復号して取得します。取得に失敗しても本文検索は継続します（添付検索のみ無効化）。
+
+なお、添付ファイル名検索は `search2`（JavaScript版詳細検索）などが使うプログラム経路（`non_format = TRUE`）では行いません。これは標準検索との結果互換を保つためです。
+
+## セキュリティ
+
+`cache/search.sqlite` にはページ本文が複製されます。次の点に注意してください。
+
+- **`cache/` ディレクトリと `.sqlite` ファイルへのWeb直接アクセスを禁止してください。** PukiWiki標準構成では `cache/` は `.htaccess` 等で保護されています。設置環境で `cache/search.sqlite` が直接ダウンロードできないことを必ず確認してください。
+- 検索結果を返す際、`$search_auth` が有効な場合は標準検索と同様に `check_readable()` で読み取り権限を確認します。**本プラグインは、標準 `do_search()` がページ名ヒットに対して認証チェックを行わない（保護ページ名が漏れうる）挙動を改め、ページ名・本文・添付ファイル名のいずれのヒットに対しても認証チェックを行います**（標準よりわずかに厳格）。`$search_auth` が無効な場合は標準と同じく認証チェックを行いません。
+
+## 標準検索との互換性
+
+ページ名・本文の検索結果は標準 `do_search()` と一致します。実コーパス（677ページ）に対し、高頻度語・固有名詞・日本語・英数字混在・複数語AND/OR・存在しない語の各パターンで、`non_format = TRUE`（プログラム経路）の結果集合が標準検索と完全一致することを確認しています。
+
+互換性のため、以下を標準検索からそのまま踏襲しています。
+
+- 検索語正規化・正規表現生成（`get_search_words()`）
+- ベース絞り込み（`#search(base)`）、`$non_list` 除外、`$whatsnew` 除外
+- AND / OR の `$b_type xor $b_match` 判定ロジック
+- `$non_format = TRUE` 時はページ名照合を行わず本文照合の結果のみ返す挙動
+- 本文は `#author` 行を除いた生データ（`remove_author_header()`）に対して照合
+
+## 初期版に含めないもの
+
+本計画は最小構成を重視しており、以下は初期版に含めていません。必要に応じて将来版で検討します。
+
+- 検索結果キャッシュ
+- N-gram索引・FTS5
+- ページ更新時の差分インデックス更新（案B）
+- 検索スニペット表示
+- 管理画面からのキャッシュ再構築
+
+## 関連
+
+- [PukiWiki](https://pukiwiki.osdn.jp/)
