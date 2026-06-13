@@ -18,17 +18,23 @@
  */
 
 // ---- 設定項目 (pukiwiki.ini.php 等で上書き可能) ----
+//
+// デフォルト値は $GLOBALS[] へ直接書く。こうすることで、PukiWiki が
+// exist_plugin() 等で「関数の中から」このファイルを require_once した場合でも、
+// 設定変数が関数ローカルに閉じ込められず、確実にグローバルへ登録される
+// (プラグイン側の関数は global 宣言でこれらを参照する)。
+// ユーザが pukiwiki.ini.php で設定済みの値は (グローバルなので) 上書きしない。
 
 // SQLite検索を有効化するか (0 で常に標準検索へフォールバック)
-if (! isset($searchsqlite_enable))            $searchsqlite_enable = 1;
+if (! isset($GLOBALS['searchsqlite_enable']))             $GLOBALS['searchsqlite_enable'] = 1;
 // 添付ファイル名検索を有効化するか
-if (! isset($searchsqlite_search_attachments)) $searchsqlite_search_attachments = 1;
+if (! isset($GLOBALS['searchsqlite_search_attachments'])) $GLOBALS['searchsqlite_search_attachments'] = 1;
 // キャッシュ鮮度検査の最小間隔 (秒)。この間隔内は鮮度検査自体を省略する
-if (! isset($searchsqlite_check_interval))     $searchsqlite_check_interval = 300;
+if (! isset($GLOBALS['searchsqlite_check_interval']))     $GLOBALS['searchsqlite_check_interval'] = 300;
 // 添付ファイル名ヒットの初期表示上限件数 (超過分は「他N件」と表示)
-if (! isset($searchsqlite_attach_show_max))    $searchsqlite_attach_show_max = 3;
+if (! isset($GLOBALS['searchsqlite_attach_show_max']))    $GLOBALS['searchsqlite_attach_show_max'] = 3;
 // デバッグ表示 (1 で検索結果末尾に診断情報を出す)
-if (! isset($searchsqlite_debug))              $searchsqlite_debug = 0;
+if (! isset($GLOBALS['searchsqlite_debug']))              $GLOBALS['searchsqlite_debug'] = 0;
 
 // max_mtime / attachment_enabled による鮮度判定を導入したため 2 に更新。
 // テーブル構造は同じだが、既存の search.sqlite を確実に作り直させるために上げる。

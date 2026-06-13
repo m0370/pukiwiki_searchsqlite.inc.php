@@ -46,39 +46,28 @@ plugin/searchsqlite.inc.php … SQLite検索本体
 
 ### 2. search.inc.php を最小改変
 
-`search.inc.php` を 2 箇所変更します。
-
-**(a) ファイル先頭（関数の外）で `searchsqlite.inc.php` を読み込む。** `define(...)` 行のあと、最初の関数定義より前に次を追加します。
-
-```php
-// --- searchsqlite: SQLiteキャッシュ版を読み込む ---
-if (file_exists(PLUGIN_DIR . 'searchsqlite.inc.php')) {
-    global $searchsqlite_enable, $searchsqlite_search_attachments,
-           $searchsqlite_check_interval, $searchsqlite_attach_show_max,
-           $searchsqlite_debug;
-    require_once(PLUGIN_DIR . 'searchsqlite.inc.php');
-}
-```
-
-**重要:** この `require_once` は必ず**関数の外（ファイルのトップレベル）**で行ってください。PukiWiki の `exist_plugin()` などは関数の中でプラグインを読み込むため、関数内で `require_once` すると `searchsqlite.inc.php` 冒頭の設定変数（`$searchsqlite_enable` 等）がその関数のローカル変数になり、プラグイン側から `global` で参照できず、常に標準検索にフォールバックしてしまいます。トップレベルで読み込み、上記のように `global` を宣言することで確実にグローバル化します。
-
-**(b) 検索実行部の `do_search` 呼び出しを差し替える。** `plugin_search_action()` 内の次の行を、
+標準 `plugin/search.inc.php` の `plugin_search_action()` 内にある以下の1行を、
 
 ```php
 $body = do_search($vars['word'], $type, FALSE, $base);
 ```
 
-次のように置き換えます。
+次のように置き換えます（変更はこの1箇所だけです）。
 
 ```php
 // --- searchsqlite: SQLiteキャッシュ版があれば使い、無ければ標準検索へ ---
+if (file_exists(PLUGIN_DIR . 'searchsqlite.inc.php')) {
+    require_once(PLUGIN_DIR . 'searchsqlite.inc.php');
+}
 $body = function_exists('plugin_searchsqlite_do_search')
     ? plugin_searchsqlite_do_search($vars['word'], $type, FALSE, $base)
     : do_search($vars['word'], $type, FALSE, $base);
 // --- searchsqlite ここまで ---
 ```
 
-本リポジトリには、この改変を適用済みの `search.inc.php`（PukiWiki標準版ベース）を同梱しています。標準の `search.inc.php` をそのまま使っている場合は、こちらで置き換えても構いません。独自に改変している場合は、上記 (a)(b) の差分のみを手で当ててください。
+`searchsqlite.inc.php` は関数の中で読み込まれますが、設定変数のデフォルトを `$GLOBALS` に登録する作りになっているため、この位置でも設定は正しくグローバルに効きます（関数の外に読み込み用のコードを別途追加する必要はありません）。
+
+本リポジトリには、この改変を適用済みの `search.inc.php`（PukiWiki標準版ベース）を同梱しています。標準の `search.inc.php` をそのまま使っている場合は、こちらで置き換えても構いません。独自に改変している場合は、上記の差分のみを手で当ててください。
 
 この設計により、`searchsqlite.inc.php` が未設置・破損、あるいは `plugin_searchsqlite_do_search()` が未定義の場合でも、自動的に標準検索へフォールバックします。
 

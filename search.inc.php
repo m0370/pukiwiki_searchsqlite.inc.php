@@ -13,15 +13,6 @@ define('PLUGIN_SEARCH_DISABLE_GET_ACCESS', 0); // 1, 0
 define('PLUGIN_SEARCH_MAX_LENGTH', 80);
 define('PLUGIN_SEARCH_MAX_BASE',   16); // #search(1,2,3,...,15,16)
 
-// --- searchsqlite: lib/plugin.php の exist_plugin() が関数内で require_once するため、
-// searchsqlite.inc.php のトップレベル変数代入を確実にグローバル化する
-if (file_exists(PLUGIN_DIR . 'searchsqlite.inc.php')) {
-	global $searchsqlite_enable, $searchsqlite_search_attachments,
-	       $searchsqlite_check_interval, $searchsqlite_attach_show_max,
-	       $searchsqlite_debug;
-	require_once(PLUGIN_DIR . 'searchsqlite.inc.php');
-}
-
 // Show a search box on a page
 function plugin_search_convert()
 {
@@ -50,6 +41,9 @@ function plugin_search_action()
 		// Search
 		$msg  = str_replace('$1', $s_word, $_title_result);
 		// --- searchsqlite: SQLiteキャッシュ版があれば使い、無ければ標準検索へ ---
+		if (file_exists(PLUGIN_DIR . 'searchsqlite.inc.php')) {
+			require_once(PLUGIN_DIR . 'searchsqlite.inc.php');
+		}
 		$body = function_exists('plugin_searchsqlite_do_search')
 			? plugin_searchsqlite_do_search($vars['word'], $type, FALSE, $base)
 			: do_search($vars['word'], $type, FALSE, $base);
