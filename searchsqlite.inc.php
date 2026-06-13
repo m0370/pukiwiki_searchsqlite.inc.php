@@ -57,6 +57,7 @@ function plugin_searchsqlite_do_search($word, $type = 'AND', $non_format = FALSE
 		return do_search($word, $type, $non_format, $base);
 	}
 
+	$db = NULL;
 	try {
 		$db = plugin_searchsqlite_open();
 		if ($db === FALSE) {
@@ -66,11 +67,14 @@ function plugin_searchsqlite_do_search($word, $type = 'AND', $non_format = FALSE
 		$result = plugin_searchsqlite_search($db, $word, $type, $non_format, $base);
 		$db->close();
 		return $result;
-	} catch (Exception $e) {
+	} catch (Throwable $e) {
+		// Exception だけでなく Error / TypeError も拾う。
+		// (破損DBで query()/prepare() が FALSE を返し、その戻り値にメソッドを
+		//  呼んだときの TypeError 等も含め、確実に標準検索へ戻す)
 		if (! empty($searchsqlite_debug)) {
 			error_log('searchsqlite: ' . $e->getMessage());
 		}
-		// あらゆる失敗で標準検索へ戻す
+		if ($db instanceof SQLite3) { @$db->close(); }
 		return do_search($word, $type, $non_format, $base);
 	}
 }
@@ -128,8 +132,10 @@ function plugin_searchsqlite_init_schema($db)
 function plugin_searchsqlite_meta_get($db, $key, $default = NULL)
 {
 	$stmt = $db->prepare('SELECT value FROM meta WHERE key = :k');
+	if ($stmt === FALSE) throw new Exception('prepare(meta_get) failed');
 	$stmt->bindValue(':k', $key, SQLITE3_TEXT);
 	$res = $stmt->execute();
+	if ($res === FALSE) throw new Exception('execute(meta_get) failed');
 	$row = $res->fetchArray(SQLITE3_ASSOC);
 	return ($row === FALSE) ? $default : $row['value'];
 }
@@ -137,6 +143,7 @@ function plugin_searchsqlite_meta_get($db, $key, $default = NULL)
 function plugin_searchsqlite_meta_set($db, $key, $value)
 {
 	$stmt = $db->prepare('INSERT OR REPLACE INTO meta(key, value) VALUES(:k, :v)');
+	if ($stmt === FALSE) throw new Exception('prepare(meta_set) failed');
 	$stmt->bindValue(':k', $key, SQLITE3_TEXT);
 	$stmt->bindValue(':v', (string)$value, SQLITE3_TEXT);
 	$stmt->execute();
@@ -147,20 +154,22 @@ function plugin_searchsqlite_meta_set($db, $key, $value)
  *
  * - last_check から $searchsqlite_check_interval 秒以内なら検査自体を省略
  * - スキーマ版が違う / 未構築 なら全再構築
- * - ページ数が変化 / いずれかのファイルが last_rebuild より新しい なら全再構築 (案A)
+ * - ページ/添付の件数が変化、または保存済み max_mtime より新しいファイルがあれば全再構築 (案A)
  */
 function plugin_searchsqlite_ensure_fresh($db)
 {
-	global $searchsqlite_check_interval;
+	global $searchsqlite_check_interval, $searchsqlite_search_attachments;
 
 	$now = time();
 	$schema = plugin_searchsqlite_meta_get($db, 'schema_version');
 	$last_rebuild = (int)plugin_searchsqlite_meta_get($db, 'last_rebuild', 0);
 	$last_check   = (int)plugin_searchsqlite_meta_get($db, 'last_check', 0);
 
-	// 一度も構築されていない or スキーマ不一致 → 強制再構築
+	// 一度も構築されていない or スキーマ不一致 → 強制再構築。
+	// この時点では使えるキャッシュが無いので、再構築できなければ ($required=TRUE)
+	// 例外を投げて標準検索へフォールバックする (空DBを検索させない)。
 	if ($schema !== PLUGIN_SEARCHSQLITE_SCHEMA_VERSION || $last_rebuild === 0) {
-		plugin_searchsqlite_rebuild($db);
+		plugin_searchsqlite_rebuild($db, TRUE);
 		return;
 	}
 
@@ -169,24 +178,36 @@ function plugin_searchsqlite_ensure_fresh($db)
 		return;
 	}
 
-	// 軽い鮮度検査: ページ数と最大mtime
-	$files = get_existpages(); // filename(encoded) => page  (readdir のみ)
+	// 鮮度検査: 件数の変化、または「保存済みの最大mtime」より新しいファイルがあれば再構築。
+	// 壁時計 last_rebuild ではなく実ファイルの最大mtimeを基準にすることで、
+	// 再構築と同一秒に更新されたファイルの取りこぼしを防ぐ。
+	$stored_max = (int)plugin_searchsqlite_meta_get($db, 'max_mtime', 0);
 	$page_count = (int)plugin_searchsqlite_meta_get($db, 'page_count', -1);
-	$need_rebuild = (count($files) !== $page_count);
 
+	$files = get_existpages(); // filename(encoded) => page  (readdir のみ)
+	$need_rebuild = (count($files) !== $page_count);
 	if (! $need_rebuild) {
 		foreach (array_keys($files) as $encoded) {
-			$path = DATA_DIR . $encoded;
-			$mt = @filemtime($path);
-			if ($mt !== FALSE && $mt > $last_rebuild) {
+			$mt = @filemtime(DATA_DIR . $encoded);
+			if ($mt !== FALSE && $mt > $stored_max) {
 				$need_rebuild = TRUE;
 				break;
 			}
 		}
 	}
 
+	// 添付検索が有効なら attach/ の件数・最大mtimeも見る (添付の追加/削除/更新を反映)
+	if (! $need_rebuild && ! empty($searchsqlite_search_attachments)) {
+		$attach_count = (int)plugin_searchsqlite_meta_get($db, 'attachment_count', -1);
+		$stat = plugin_searchsqlite_scan_attachments();
+		if ($stat['count'] !== $attach_count || $stat['max_mtime'] > $stored_max) {
+			$need_rebuild = TRUE;
+		}
+	}
+
 	if ($need_rebuild) {
-		plugin_searchsqlite_rebuild($db);
+		// 既存の有効キャッシュがあるので、ロックを取れなければ既存DBで検索してよい ($required=FALSE)
+		plugin_searchsqlite_rebuild($db, FALSE);
 	} else {
 		// 検査だけ通過した場合も last_check を更新して次回検査を間引く
 		plugin_searchsqlite_meta_set($db, 'last_check', $now);
@@ -194,25 +215,34 @@ function plugin_searchsqlite_ensure_fresh($db)
 }
 
 /**
- * キャッシュ全再構築 (案A)。lock を取れなければ既存DBのまま使う。
+ * キャッシュ全再構築 (案A)。
+ *
+ * @param boolean $required TRUE のとき、lock を取れなければ例外を投げる
+ *   (使えるキャッシュが無い初回構築時。空DBを検索させず標準検索へ戻すため)。
+ *   FALSE のとき、lock を取れなければ既存DBのまま使う (鮮度更新は他プロセスに任せる)。
  */
-function plugin_searchsqlite_rebuild($db)
+function plugin_searchsqlite_rebuild($db, $required = FALSE)
 {
 	global $searchsqlite_search_attachments;
 
 	// 多重再構築防止。非ブロッキングで取れなければ他プロセスに任せる
 	$lock_fp = @fopen(PLUGIN_SEARCHSQLITE_LOCK, 'c');
 	if ($lock_fp === FALSE) {
-		// lock ファイルが作れない → 再構築は諦め、既存DBで検索 (or 上位でフォールバック)
+		// lock ファイルが作れない (cache 書込不可など) → 標準検索へフォールバック
 		throw new Exception('cannot open lock file');
 	}
 	if (! flock($lock_fp, LOCK_EX | LOCK_NB)) {
-		// 別プロセスが再構築中。既存DBをそのまま使う
 		fclose($lock_fp);
+		if ($required) {
+			// 別プロセスが初回構築中。まだ使えるキャッシュが無いので標準検索へ戻す
+			throw new Exception('cache is being built by another process');
+		}
+		// 既存DBが有効なのでそのまま使う
 		return;
 	}
 
 	$now = time();
+	$max_mtime = 0;
 	try {
 		$db->exec('BEGIN');
 		$db->exec('DELETE FROM pages');
@@ -220,11 +250,13 @@ function plugin_searchsqlite_rebuild($db)
 
 		$files = get_existpages(); // encoded filename => page name
 		$ins = $db->prepare('INSERT OR REPLACE INTO pages(page, filename, mtime, body) VALUES(:p, :f, :m, :b)');
+		if ($ins === FALSE) throw new Exception('prepare(pages) failed');
 		$page_count = 0;
 		foreach ($files as $encoded => $page) {
 			$path = DATA_DIR . $encoded;
 			$mtime = @filemtime($path);
 			if ($mtime === FALSE) continue;
+			if ($mtime > $max_mtime) $max_mtime = $mtime;
 			// do_search と同一の生本文 (raw=TRUE: CR も保持)
 			$body = get_source($page, TRUE, TRUE, TRUE);
 			if ($body === FALSE) $body = '';
@@ -239,8 +271,17 @@ function plugin_searchsqlite_rebuild($db)
 
 		$attachment_count = 0;
 		if (! empty($searchsqlite_search_attachments)) {
-			$attachment_count = plugin_searchsqlite_index_attachments($db);
+			$ares = plugin_searchsqlite_index_attachments($db);
+			$attachment_count = $ares['count'];
+			if ($ares['max_mtime'] > $max_mtime) $max_mtime = $ares['max_mtime'];
 		}
+
+		// mtime は秒精度なので、最新ファイルの mtime が「いま」と同じ秒以上のときは、
+		// その秒はまだ進行中で信頼できない (読み取り直後に同一秒で再編集される競合が
+		// ありうる)。保存する max_mtime を now-1 に切り下げることで、次回検査で
+		// ちょうど一度だけ再検証させる (>= を使うと静止系で毎回再構築する無限ループに
+		// なるため、この切り下げ方式で同一秒競合を無限ループなしに検出する)。
+		$store_max = ($max_mtime >= $now) ? ($now - 1) : $max_mtime;
 
 		plugin_searchsqlite_meta_set($db, 'schema_version', PLUGIN_SEARCHSQLITE_SCHEMA_VERSION);
 		plugin_searchsqlite_meta_set($db, 'plugin_version', PLUGIN_SEARCHSQLITE_PLUGIN_VERSION);
@@ -248,9 +289,10 @@ function plugin_searchsqlite_rebuild($db)
 		plugin_searchsqlite_meta_set($db, 'last_check', $now);
 		plugin_searchsqlite_meta_set($db, 'page_count', $page_count);
 		plugin_searchsqlite_meta_set($db, 'attachment_count', $attachment_count);
+		plugin_searchsqlite_meta_set($db, 'max_mtime', $store_max);
 
 		$db->exec('COMMIT');
-	} catch (Exception $e) {
+	} catch (Throwable $e) {
 		@$db->exec('ROLLBACK');
 		flock($lock_fp, LOCK_UN);
 		fclose($lock_fp);
@@ -262,20 +304,46 @@ function plugin_searchsqlite_rebuild($db)
 }
 
 /**
- * attach/ を走査し添付ファイル名を attachments に登録。登録件数を返す。
+ * attach/ を走査し、現物添付ファイルの件数と最大mtimeを返す (DBには触れない)。
+ * 鮮度検査で添付の追加/削除/更新を検出するために使う。
+ *
+ * @return array('count' => int, 'max_mtime' => int)
+ */
+function plugin_searchsqlite_scan_attachments()
+{
+	$result = array('count' => 0, 'max_mtime' => 0);
+	if (! defined('UPLOAD_DIR') || ! is_dir(UPLOAD_DIR)) return $result;
+	$dp = @opendir(UPLOAD_DIR);
+	if ($dp === FALSE) return $result;
+	while (($file = readdir($dp)) !== FALSE) {
+		// 現物のみ: HEX_HEX (末尾 .N バックアップや .log を除外)
+		if (! preg_match('/^[0-9A-Fa-f]+_[0-9A-Fa-f]+$/', $file)) continue;
+		$result['count']++;
+		$mt = @filemtime(UPLOAD_DIR . $file);
+		if ($mt !== FALSE && $mt > $result['max_mtime']) $result['max_mtime'] = $mt;
+	}
+	closedir($dp);
+	return $result;
+}
+
+/**
+ * attach/ を走査し添付ファイル名を attachments に登録。
  *
  * 添付ファイルは UPLOAD_DIR に `HEXページ名_HEXファイル名` 形式で保存される。
  * 末尾に .N (世代バックアップ) や .log が付くものは現物ではないので除外する。
- * 取得に失敗しても例外を投げず 0 を返す (本文検索は継続する)。
+ * 取得に失敗しても例外を投げず 0 件で返す (本文検索は継続する)。
+ *
+ * @return array('count' => int, 'max_mtime' => int)
  */
 function plugin_searchsqlite_index_attachments($db)
 {
-	if (! defined('UPLOAD_DIR') || ! is_dir(UPLOAD_DIR)) return 0;
+	$ret = array('count' => 0, 'max_mtime' => 0);
+	if (! defined('UPLOAD_DIR') || ! is_dir(UPLOAD_DIR)) return $ret;
 	$dp = @opendir(UPLOAD_DIR);
-	if ($dp === FALSE) return 0;
+	if ($dp === FALSE) return $ret;
 
 	$ins = $db->prepare('INSERT OR REPLACE INTO attachments(page, filename, mtime, size) VALUES(:p, :f, :m, :s)');
-	$count = 0;
+	if ($ins === FALSE) { closedir($dp); return $ret; }
 	while (($file = readdir($dp)) !== FALSE) {
 		// 現物のみ: HEX_HEX (末尾拡張子なし)
 		if (! preg_match('/^([0-9A-Fa-f]+)_([0-9A-Fa-f]+)$/', $file, $m)) continue;
@@ -283,16 +351,18 @@ function plugin_searchsqlite_index_attachments($db)
 		$name = pkwk_hex2bin($m[2]);
 		if ($page === '' || $name === '') continue;
 		$path = UPLOAD_DIR . $file;
+		$mt = @filemtime($path);
+		if ($mt !== FALSE && $mt > $ret['max_mtime']) $ret['max_mtime'] = $mt;
 		$ins->bindValue(':p', $page, SQLITE3_TEXT);
 		$ins->bindValue(':f', $name, SQLITE3_TEXT);
-		$ins->bindValue(':m', @filemtime($path), SQLITE3_INTEGER);
-		$ins->bindValue(':s', @filesize($path),  SQLITE3_INTEGER);
+		$ins->bindValue(':m', $mt, SQLITE3_INTEGER);
+		$ins->bindValue(':s', @filesize($path), SQLITE3_INTEGER);
 		$ins->execute();
 		$ins->reset();
-		$count++;
+		$ret['count']++;
 	}
 	closedir($dp);
-	return $count;
+	return $ret;
 }
 
 /**
@@ -318,8 +388,10 @@ function plugin_searchsqlite_search($db, $word, $type, $non_format, $base)
 	}
 
 	// pages テーブルから全ページの本文を読み込む (1クエリ)
+	// query() が FALSE を返したら (DB破損等) 例外を投げ、上位で標準検索へ戻す
 	$bodies = array(); // page => body
 	$res = $db->query('SELECT page, body FROM pages');
+	if ($res === FALSE) throw new Exception('query(pages) failed');
 	while (($row = $res->fetchArray(SQLITE3_ASSOC)) !== FALSE) {
 		$bodies[$row['page']] = $row['body'];
 	}
@@ -443,6 +515,7 @@ function plugin_searchsqlite_get_attachments($db, $page)
 	// Caching it in a static would reuse a closed handle on the next call, so
 	// prepare per call. This runs only for pages that missed name/body match.
 	$stmt = $db->prepare('SELECT filename FROM attachments WHERE page = :p');
+	if ($stmt === FALSE) return array();
 	$stmt->bindValue(':p', $page, SQLITE3_TEXT);
 	$res = $stmt->execute();
 	$names = array();
