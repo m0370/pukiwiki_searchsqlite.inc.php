@@ -13,7 +13,7 @@
  *
  *  @license    https://www.gnu.org/licenses/gpl.html GPL v2
  *  @link       https://github.com/m0370/pukiwiki_searchsqlite.inc.php
- *  @version    0.1.0 (2026-06-13)
+ *  @version    0.2.0 (2026-06-13)
  *  @package    plugin
  */
 
@@ -30,10 +30,12 @@ if (! isset($searchsqlite_attach_show_max))    $searchsqlite_attach_show_max = 3
 // デバッグ表示 (1 で検索結果末尾に診断情報を出す)
 if (! isset($searchsqlite_debug))              $searchsqlite_debug = 0;
 
+// max_mtime / attachment_enabled による鮮度判定を導入したため 2 に更新。
+// テーブル構造は同じだが、既存の search.sqlite を確実に作り直させるために上げる。
 if (! defined('PLUGIN_SEARCHSQLITE_SCHEMA_VERSION'))
-	define('PLUGIN_SEARCHSQLITE_SCHEMA_VERSION', '1');
+	define('PLUGIN_SEARCHSQLITE_SCHEMA_VERSION', '2');
 if (! defined('PLUGIN_SEARCHSQLITE_PLUGIN_VERSION'))
-	define('PLUGIN_SEARCHSQLITE_PLUGIN_VERSION', '0.1.0');
+	define('PLUGIN_SEARCHSQLITE_PLUGIN_VERSION', '0.2.0');
 if (! defined('PLUGIN_SEARCHSQLITE_DB'))
 	define('PLUGIN_SEARCHSQLITE_DB',   CACHE_DIR . 'search.sqlite');
 if (! defined('PLUGIN_SEARCHSQLITE_LOCK'))
@@ -98,11 +100,33 @@ function plugin_searchsqlite_open()
 }
 
 /**
+ * $db->exec() を実行し、失敗 (FALSE) なら例外を投げる。
+ * SQLite3 は失敗時に例外ではなく FALSE を返すことがあるため、
+ * 書き込みの取りこぼし (欠けたDBを fresh 扱いする事故) を防ぐ。
+ */
+function plugin_searchsqlite_exec($db, $sql)
+{
+	if ($db->exec($sql) === FALSE) {
+		throw new Exception('exec failed: ' . $db->lastErrorMsg());
+	}
+}
+
+/**
+ * $stmt->execute() を実行し、失敗 (FALSE) なら例外を投げる。
+ */
+function plugin_searchsqlite_execute($db, $stmt)
+{
+	if ($stmt->execute() === FALSE) {
+		throw new Exception('execute failed: ' . $db->lastErrorMsg());
+	}
+}
+
+/**
  * スキーマ初期化。冪等。
  */
 function plugin_searchsqlite_init_schema($db)
 {
-	$db->exec(
+	plugin_searchsqlite_exec($db,
 		'CREATE TABLE IF NOT EXISTS pages (' .
 		'  page TEXT PRIMARY KEY,' .
 		'  filename TEXT NOT NULL,' .
@@ -110,8 +134,8 @@ function plugin_searchsqlite_init_schema($db)
 		'  body TEXT NOT NULL' .
 		')'
 	);
-	$db->exec('CREATE INDEX IF NOT EXISTS pages_mtime_idx ON pages(mtime)');
-	$db->exec(
+	plugin_searchsqlite_exec($db, 'CREATE INDEX IF NOT EXISTS pages_mtime_idx ON pages(mtime)');
+	plugin_searchsqlite_exec($db,
 		'CREATE TABLE IF NOT EXISTS attachments (' .
 		'  page TEXT NOT NULL,' .
 		'  filename TEXT NOT NULL,' .
@@ -120,8 +144,8 @@ function plugin_searchsqlite_init_schema($db)
 		'  PRIMARY KEY(page, filename)' .
 		')'
 	);
-	$db->exec('CREATE INDEX IF NOT EXISTS attachments_page_idx ON attachments(page)');
-	$db->exec(
+	plugin_searchsqlite_exec($db, 'CREATE INDEX IF NOT EXISTS attachments_page_idx ON attachments(page)');
+	plugin_searchsqlite_exec($db,
 		'CREATE TABLE IF NOT EXISTS meta (' .
 		'  key TEXT PRIMARY KEY,' .
 		'  value TEXT NOT NULL' .
@@ -146,7 +170,7 @@ function plugin_searchsqlite_meta_set($db, $key, $value)
 	if ($stmt === FALSE) throw new Exception('prepare(meta_set) failed');
 	$stmt->bindValue(':k', $key, SQLITE3_TEXT);
 	$stmt->bindValue(':v', (string)$value, SQLITE3_TEXT);
-	$stmt->execute();
+	plugin_searchsqlite_execute($db, $stmt);
 }
 
 /**
@@ -170,6 +194,15 @@ function plugin_searchsqlite_ensure_fresh($db)
 	// 例外を投げて標準検索へフォールバックする (空DBを検索させない)。
 	if ($schema !== PLUGIN_SEARCHSQLITE_SCHEMA_VERSION || $last_rebuild === 0) {
 		plugin_searchsqlite_rebuild($db, TRUE);
+		return;
+	}
+
+	// 添付検索の有効/無効を切り替えたら、検査間隔に関係なく再構築する。
+	// (OFFで構築したDBを直後にONにしても添付テーブルが空のままになるのを防ぐ)
+	$want_attach   = ! empty($searchsqlite_search_attachments) ? 1 : 0;
+	$built_attach  = (int)plugin_searchsqlite_meta_get($db, 'attachment_enabled', 0);
+	if ($want_attach !== $built_attach) {
+		plugin_searchsqlite_rebuild($db, FALSE);
 		return;
 	}
 
@@ -243,10 +276,11 @@ function plugin_searchsqlite_rebuild($db, $required = FALSE)
 
 	$now = time();
 	$max_mtime = 0;
+	$attach_enabled = ! empty($searchsqlite_search_attachments) ? 1 : 0;
 	try {
-		$db->exec('BEGIN');
-		$db->exec('DELETE FROM pages');
-		$db->exec('DELETE FROM attachments');
+		plugin_searchsqlite_exec($db, 'BEGIN');
+		plugin_searchsqlite_exec($db, 'DELETE FROM pages');
+		plugin_searchsqlite_exec($db, 'DELETE FROM attachments');
 
 		$files = get_existpages(); // encoded filename => page name
 		$ins = $db->prepare('INSERT OR REPLACE INTO pages(page, filename, mtime, body) VALUES(:p, :f, :m, :b)');
@@ -264,13 +298,13 @@ function plugin_searchsqlite_rebuild($db, $required = FALSE)
 			$ins->bindValue(':f', $encoded, SQLITE3_TEXT);
 			$ins->bindValue(':m', $mtime,  SQLITE3_INTEGER);
 			$ins->bindValue(':b', $body,   SQLITE3_TEXT);
-			$ins->execute();
+			plugin_searchsqlite_execute($db, $ins);
 			$ins->reset();
 			$page_count++;
 		}
 
 		$attachment_count = 0;
-		if (! empty($searchsqlite_search_attachments)) {
+		if ($attach_enabled) {
 			$ares = plugin_searchsqlite_index_attachments($db);
 			$attachment_count = $ares['count'];
 			if ($ares['max_mtime'] > $max_mtime) $max_mtime = $ares['max_mtime'];
@@ -290,8 +324,10 @@ function plugin_searchsqlite_rebuild($db, $required = FALSE)
 		plugin_searchsqlite_meta_set($db, 'page_count', $page_count);
 		plugin_searchsqlite_meta_set($db, 'attachment_count', $attachment_count);
 		plugin_searchsqlite_meta_set($db, 'max_mtime', $store_max);
+		// このDBが添付ファイルをインデックス済みか。設定変更の検出に使う
+		plugin_searchsqlite_meta_set($db, 'attachment_enabled', $attach_enabled);
 
-		$db->exec('COMMIT');
+		plugin_searchsqlite_exec($db, 'COMMIT');
 	} catch (Throwable $e) {
 		@$db->exec('ROLLBACK');
 		flock($lock_fp, LOCK_UN);
@@ -514,10 +550,13 @@ function plugin_searchsqlite_get_attachments($db, $page)
 	// plugin_searchsqlite_do_search() call opens/closes its own connection.
 	// Caching it in a static would reuse a closed handle on the next call, so
 	// prepare per call. This runs only for pages that missed name/body match.
+	// 添付名取得の失敗は致命的ではない (追加仕様)。prepare/execute いずれの失敗でも
+	// 空配列を返し、本文・ページ名の検索結果はそのまま返す (検索全体は止めない)。
 	$stmt = $db->prepare('SELECT filename FROM attachments WHERE page = :p');
 	if ($stmt === FALSE) return array();
 	$stmt->bindValue(':p', $page, SQLITE3_TEXT);
 	$res = $stmt->execute();
+	if ($res === FALSE) { $stmt->close(); return array(); }
 	$names = array();
 	while (($row = $res->fetchArray(SQLITE3_ASSOC)) !== FALSE) {
 		$names[] = $row['filename'];

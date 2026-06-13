@@ -103,6 +103,7 @@ cache/search.lock     … 再構築時の多重実行を防ぐロックファイ
 $searchsqlite_enable = 1;
 
 // 添付ファイル名検索を有効化するか
+// (この値を変更すると、鮮度検査間隔に関係なく次回検索時にキャッシュを作り直します)
 $searchsqlite_search_attachments = 1;
 
 // キャッシュ鮮度検査の最小間隔（秒）
